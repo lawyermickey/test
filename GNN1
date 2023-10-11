@@ -1,0 +1,164 @@
+# 导入所需的库
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch_geometric.nn as gnn
+import torch_geometric.data as gdata
+import requests
+import pandas as pd
+import numpy as np
+from datetime import datetime, timedelta
+
+# 定义超参数
+num_nodes = 100 # 要考虑的加密货币数量
+num_features = 16 # 每个节点的初始特征维度
+num_hidden = 32 # GNN中隐藏层的维度
+num_classes = 2 # 输出层的维度（预测比特币价格变化百分比和标准差）
+num_epochs = 10 # 训练轮数
+batch_size = 32 # 批次大小
+learning_rate = 0.01 # 学习率
+threshold = -0.05 # 预测阈值，低于该值则认为比特币暴跌
+
+# 定义GNN模型，使用图卷积层和全连接层
+class GNN(nn.Module):
+    def __init__(self, num_features, num_hidden, num_classes):
+        super(GNN, self).__init__()
+        self.conv1 = gnn.GCNConv(num_features, num_hidden)
+        self.conv2 = gnn.GCNConv(num_hidden, num_hidden)
+        self.fc = nn.Linear(num_hidden, num_classes)
+
+    def forward(self, data):
+        x, edge_index, edge_weight = data.x, data.edge_index, data.edge_attr
+        x = F.relu(self.conv1(x, edge_index, edge_weight))
+        x = F.dropout(x, p=0.5, training=self.training)
+        x = F.relu(self.conv2(x, edge_index, edge_weight))
+        x = F.dropout(x, p=0.5, training=self.training)
+        x = self.fc(x)
+        return x
+
+# 定义损失函数和优化器
+model = GNN(num_features, num_hidden, num_classes)
+criterion = nn.MSELoss()
+optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+
+# 定义数据获取和处理函数
+def get_data():
+    # 使用CoinGecko API获取加密货币的历史数据，包括价格、市值、交易量等
+    url = "https://api.coingecko.com/api/v3/coins/markets"
+    params = {
+        "vs_currency": "usd",
+        "order": "market_cap_desc",
+        "per_page": num_nodes,
+        "page": 1,
+        "sparkline": False,
+        "price_change_percentage": "24h"
+    }
+    response = requests.get(url, params=params)
+    coins = response.json()
+
+    # 获取当前时间和24小时前的时间戳
+    now = datetime.now()
+    before = now - timedelta(hours=24)
+    now_ts = int(now.timestamp())
+    before_ts = int(before.timestamp())
+
+    # 创建一个空的数据框，用于存储每个节点的特征
+    df = pd.DataFrame()
+
+    # 遍历每个加密货币，获取其相关的社交媒体指标，如推特关注数、Reddit订阅数等
+    for coin in coins:
+        coin_id = coin["id"]
+        coin_symbol = coin["symbol"]
+        url = f"https://api.coingecko.com/api/v3/coins/{coin_id}"
+        params = {
+            "localization": False,
+            "tickers": False,
+            "market_data": False,
+            "community_data": True,
+            "developer_data": False,
+            "sparkline": False
+        }
+        response = requests.get(url, params=params)
+        coin_data = response.json()
+        # 将社交媒体指标添加到数据框中
+        df.loc[coin_symbol, "twitter_followers"] = coin_data["community_data"]["twitter_followers"]
+        df.loc[coin_symbol, "reddit_subscribers"] = coin_data["community_data"]["reddit_subscribers"]
+        df.loc[coin_symbol, "reddit_accounts_active_48h"] = coin_data["community_data"]["reddit_accounts_active_48h"]
+
+        # 获取加密货币的价格历史数据，计算其价格变化百分比和波动率
+        url = f"https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart/range"
+        params = {
+            "vs_currency": "usd",
+            "from": before_ts,
+            "to": now_ts
+        }
+        response = requests.get(url, params=params)
+        coin_data = response.json()
+        prices = np.array(coin_data["prices"])[:, 1]
+        # 将价格变化百分比和波动率添加到数据框中
+        df.loc[coin_symbol, "price_change_percentage"] = coin["price_change_percentage_24h"]
+        df.loc[coin_symbol, "price_volatility"] = np.std(prices) / np.mean(prices)
+
+    # 对数据框中的特征进行归一化处理，使其在0到1之间
+    df = (df - df.min()) / (df.max() - df.min())
+
+    # 将数据框转换为PyTorch张量
+    x = torch.tensor(df.values, dtype=torch.float)
+
+    # 根据加密货币之间的相关性构建一个加权无向图，使用皮尔逊相关系数作为边的权重
+    corr = df.corr().abs()
+    edge_index = []
+    edge_weight = []
+    for i in range(num_nodes):
+        for j in range(i+1, num_nodes):
+            edge_index.append([i, j])
+            edge_index.append([j, i])
+            edge_weight.append(corr.iloc[i, j])
+            edge_weight.append(corr.iloc[i, j])
+    edge_index = torch.tensor(edge_index, dtype=torch.long).t()
+    edge_weight = torch.tensor(edge_weight, dtype=torch.float)
+
+    # 创建一个PyTorch Geometric数据对象，包含节点特征、边索引和边权重
+    data = gdata.Data(x=x, edge_index=edge_index, edge_attr=edge_weight)
+
+    # 返回数据对象
+    return data
+
+# 获取数据
+data = get_data()
+
+# 划分训练集和测试集，使用比特币作为测试集，其他加密货币作为训练集
+train_mask = data.x[:, 0] != 1 # 比特币的特征向量的第一个元素是1，其他加密货币都不是
+test_mask = ~train_mask
+data.train_mask = train_mask
+data.test_mask = test_mask
+
+# 训练模型
+model.train()
+for epoch in range(num_epochs):
+    optimizer.zero_grad()
+    out = model(data)
+    loss = criterion(out[data.train_mask], data.x[data.train_mask, -2:])
+    loss.backward()
+    optimizer.step()
+    print(f"Epoch {epoch+1}, Loss: {loss.item():.4f}")
+
+# 测试模型
+model.eval()
+with torch.no_grad():
+    out = model(data)
+    pred_mean = out[data.test_mask, 0].item()
+    pred_std = out[data.test_mask, 1].item()
+    true_mean = data.x[data.test_mask, -2].item()
+    print(f"Predicted price change percentage: {pred_mean:.4f} ± {pred_std:.4f}")
+    print(f"True price change percentage: {true_mean:.4f}")
+    
+    # 计算置信区间，使用95%的可信度和1.96的置信系数
+    conf_coef = 1.96
+    conf_lower = pred_mean - conf_coef * pred_std
+conf_upper = pred_mean + conf_coef * pred_std
+print(f"Confidence interval: [{conf_lower:.4f}, {conf_upper:.4f}]")
+if pred_mean < threshold:
+    print(f"Prediction: Bitcoin will crash in the next 24 hours.")
+else:
+    print(f"Prediction: Bitcoin will not crash in the next 24 hours.")
