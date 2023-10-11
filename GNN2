@@ -1,0 +1,81 @@
+# 导入所需的库
+import torch
+import torch.nn as nn
+import torch_geometric
+from torch_geometric.data import Data
+from torch_geometric.nn import GCNConv
+import pandas as pd
+
+# 加载数据集，假设数据集是一个csv文件，每一行包含一个加密货币的名称、特征和标签
+# 特征包括价格、交易量、市值、流通量等
+# 标签是比特币单日是否暴跌（0或1）
+dataset = pd.read_csv("dataset.csv")
+
+# 提取加密货币的名称和特征
+names = dataset["name"].values # 一个包含加密货币名称的列表
+features = dataset.drop(["name", "label"], axis=1).values # 一个包含加密货币特征的矩阵，每一行对应一个加密货币，每一列对应一个特征
+features = torch.tensor(features, dtype=torch.float) # 将特征矩阵转换为张量
+
+# 提取比特币单日是否暴跌的标签
+labels = dataset["label"].values # 一个包含比特币单日是否暴跌的标签的列表
+labels = torch.tensor(labels, dtype=torch.long) # 将标签列表转换为张量
+
+# 根据加密货币之间的皮尔逊相关系数构建邻接矩阵，假设相关系数是一个csv文件，每一行包含两个加密货币的名称和它们之间的相关系数
+correlations = pd.read_csv("correlations.csv")
+correlations = correlations.pivot(index="name1", columns="name2", values="coefficient") # 将相关性数据转换为一个方阵，每一行和每一列对应一个加密货币，每个元素对应两个加密货币之间的相关系数
+correlations = correlations.loc[names, names] # 按照数据集中的加密货币顺序重新排列邻接矩阵
+adjacency_matrix = correlations.values # 提取邻接矩阵的值
+adjacency_matrix = torch.tensor(adjacency_matrix, dtype=torch.float) # 将邻接矩阵转换为张量
+
+# 根据邻接矩阵创建图数据，使用torch_geometric.utils.dense_to_sparse函数将邻接矩阵转换为边缘索引格式
+edge_index = torch_geometric.utils.dense_to_sparse(adjacency_matrix)[0] # 提取边缘索引张量
+graph_data = Data(x=features, edge_index=edge_index, y=labels) # 创建图数据对象
+
+# 定义图神经网络模型，使用torch_geometric.nn.GCNConv类来定义图卷积网络层，使用torch.nn.ReLU类来定义激活函数，使用torch.nn.Dropout类来定义正则化方法
+class GNN(nn.Module):
+    def __init__(self, input_dim, hidden_dim, output_dim):
+        super(GNN, self).__init__()
+        self.conv1 = GCNConv(input_dim, hidden_dim) # 定义第一层图卷积网络，输入维度为input_dim，输出维度为hidden_dim
+        self.relu = nn.ReLU() # 定义激活函数为ReLU
+        self.dropout = nn.Dropout(p=0.5) # 定义正则化方法为Dropout，丢弃概率为0.5
+        self.conv2 = GCNConv(hidden_dim, output_dim) # 定义第二层图卷积网络，输入维度为hidden_dim，输出维度为output_dim
+    
+    def forward(self, data):
+        x, edge_index = data.x, data.edge_index # 提取图数据中的节点特征和边缘索引
+        x = self.conv1(x, edge_index) # 对节点特征进行第一次图卷积操作
+        x = self.relu(x) # 对节点特征进行激活函数操作
+        x = self.dropout(x) # 对节点特征进行正则化操作
+        x = self.conv2(x, edge_index) # 对节点特征进行第二次图卷积操作
+        return x # 返回节点特征
+
+# 定义模型参数，假设输入特征的维度为10，隐藏层的维度为32，输出特征的维度为2（对应两个类别）
+input_dim = 10
+hidden_dim = 32
+output_dim = 2
+
+# 创建模型对象
+model = GNN(input_dim, hidden_dim, output_dim)
+
+# 定义损失函数，使用torch.nn.CrossEntropyLoss类来定义多分类问题的损失函数
+criterion = nn.CrossEntropyLoss()
+
+# 定义优化器，使用torch.optim.Adam类来定义优化方法，使用默认的学习率和权重衰减参数
+optimizer = torch.optim.Adam(model.parameters())
+
+# 定义训练过程，假设训练的轮数为100
+epochs = 100
+for epoch in range(epochs):
+    # 将模型设置为训练模式
+    model.train()
+    # 清空梯度
+    optimizer.zero_grad()
+    # 前向传播，得到模型的输出
+    output = model(graph_data)
+    # 计算损失，只考虑比特币对应的输出和标签
+    loss = criterion(output[-1].unsqueeze(0), graph_data.y[-1].unsqueeze(0))
+    # 反向传播，计算梯度
+    loss.backward()
+    # 更新参数
+    optimizer.step()
+    # 打印训练信息
+    print(f"Epoch {epoch+1}, Loss: {loss.item()}")
